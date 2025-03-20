@@ -787,12 +787,12 @@ class StudentUSocket(StudentUSocketBase):
     # fifth, check ACK field
     if self.state in (ESTABLISHED, FIN_WAIT_1, FIN_WAIT_2, CLOSE_WAIT, CLOSING):
       ## Start of Stage 4.1 ##
-      if snd.una |LT| seg.ack and seg.ack |LE| snd.nxt:
+      if snd.una |LE| seg.ack and seg.ack |LE| snd.nxt:
         # ACK represents a sent but unacked packet
         self.handle_accepted_ack(seg)
-      elif seg.ack |LE| snd.una:
+      elif seg.ack |LT| snd.una:
         # Old ACK (already acked before)
-        # continue_after_ack = False
+        continue_after_ack = False
         pass
       elif seg.ack |GT| snd.nxt:
         # ACK for unset data
