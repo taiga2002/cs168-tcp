@@ -184,6 +184,8 @@ class StudentUSocketBase(object):
     """
     Send some data
     """
+    available_window = self.snd.una + self.snd.wnd - self.snd.nxt
+    self.log.debug(f"Available window: {available_window}, snd.una: {self.snd.una}, snd.wnd: {self.snd.wnd}, snd.nxt: {self.snd.nxt}")
     # RFC 793 p56
     # We vary from the RFC in a few ways.  First, we just don't allow
     # sends from some states that is wants you to queue things up
@@ -566,10 +568,8 @@ class StudentUSocket(StudentUSocketBase):
     if (p.tcp.SYN or p.tcp.FIN or p.tcp.payload) and not retxed:
 
       ## Start of Stage 4.4 ##
-      if p.tcp.payload:
-        self.snd.nxt = self.snd.nxt |PLUS| len(p.tcp.payload)
-      if p.tcp.SYN or p.tcp.FIN:
-        self.snd.nxt = self.snd.nxt |PLUS| 1
+      if len(p.tcp.payload) > 0:
+        self.snd.nxt = p.tcp.seq |PLUS| len(p.tcp.payload)
       ## End of Stage 4.4 ##
       pass
 
@@ -597,10 +597,10 @@ class StudentUSocket(StudentUSocketBase):
     if self.state is CLOSED:
       return
     ## Start of Stage 1.2 ##
-    if self.state is SYN_SENT:
+    elif self.state is SYN_SENT:
       self.handle_synsent(seg)
     ## End of Stage 1.2 ##
-    if self.state in (ESTABLISHED, FIN_WAIT_1, FIN_WAIT_2,
+    elif self.state in (ESTABLISHED, FIN_WAIT_1, FIN_WAIT_2,
                         CLOSE_WAIT, CLOSING, LAST_ACK, TIME_WAIT):
       if self.acceptable_seg(seg, payload):
         # ## Start of Stage 2.1 ##
@@ -625,10 +625,9 @@ class StudentUSocket(StudentUSocketBase):
       if seq |GT| self.rcv.nxt:
         self.set_pending_ack()
         break
-      self.rx_queue.pop()
+      _, p = self.rx_queue.pop()
       data = p.app[self.rcv.nxt |MINUS| p.tcp.seq:]
-      if data:
-        self.handle_accepted_seg(p.tcp, data)
+      self.handle_accepted_seg(p.tcp, data)
     ## End of Stage 3.2 ##
 
     self.maybe_send()
@@ -719,7 +718,7 @@ class StudentUSocket(StudentUSocketBase):
     """
 
     ## Start of Stage 5.1 ##
-    self.snd.wnd = self.TX_DATA_MAX # remove when implemented
+    self.snd.wnd = seg.win 
     self.snd.wl1 = seg.seq
     self.snd.wl2 = seg.ack
 
@@ -734,6 +733,7 @@ class StudentUSocket(StudentUSocketBase):
     """
     ## Start of Stage 4.2 ##
     self.snd.una = seg.ack
+    
     # self.retx_queue.pop_upto(seg.ack)
     ## End of Stage 4.2 ##
 
@@ -793,10 +793,11 @@ class StudentUSocket(StudentUSocketBase):
       elif seg.ack |LT| snd.una:
         # Old ACK (already acked before)
         continue_after_ack = False
-        pass
+
       elif seg.ack |GT| snd.nxt:
         # ACK for unset data
-        return False
+        continue_after_ack = False
+        return continue_after_ack
       ## End of Stage 4.1 ##
 
       if snd.una |LE| seg.ack and seg.ack |LE| snd.nxt:
@@ -865,25 +866,21 @@ class StudentUSocket(StudentUSocketBase):
     bytes_sent = 0
 
     ## Start of Stage 4.3 ##
-    self.log.debug(f"Initial tx_data length: {len(self.tx_data)}")
-    while self.tx_data:
-      remaining = (snd.una |PLUS| snd.wnd) |MINUS| snd.nxt
-      if remaining <= 0:
-        self.log.debug("No more space in send window")
-        break
-      seg_size = min(remaining, len(self.tx_data), self.mss)
-      if seg_size == 0:
-        self.log.debug("Can't send any more data")
-        break
-
+    # Check if there's space in the send window before entering the loop
+    
+    remaining = (snd.una |PLUS| snd.wnd) |MINUS| snd.nxt
+    while remaining > 0:
+      seg_size = min(remaining, self.mss)
       payload = self.tx_data[:seg_size]
+      if not payload:
+        break
       packet = self.new_packet(data=payload)
       self.log.debug(f"Sending packet: seqno={self.snd.nxt}, size={seg_size}, payload={payload[:20]}...")
       self.tx(packet)
       # self.retx_queue.push(packet)
       # self.snd.nxt = self.snd.nxt |PLUS| seg_size
       self.tx_data = self.tx_data[seg_size:]
-
+      remaining = (snd.una |PLUS| snd.wnd) |MINUS| snd.nxt
       num_pkts += 1
       bytes_sent += seg_size
       self.log.debug(f"After send: snd.nxt={self.snd.nxt}, remaining tx_data={len(self.tx_data)}")
