@@ -480,14 +480,15 @@ class StudentUSocket(StudentUSocketBase):
       self._delete_tcb()
     elif self.state is ESTABLISHED:
       ## Start of Stage 7.1 ##
-
+      # Step 1: Set a pending Fin and move to FIN_WAIT_1
+      self.fin_ctrl.set_pending(FIN_WAIT_1)
       ## End of Stage 7.1 ##
       pass
     elif self.state in (FIN_WAIT_1,FIN_WAIT_2):
       raise RuntimeError("close() is invalid in FIN_WAIT states")
     elif self.state is CLOSE_WAIT:
       ## Start of Stage 6.2 ##
-
+      self.fin_ctrl.set_pending(LAST_ACK)
       ## End of Stage 6.2 ##
       pass
     elif self.state in (CLOSING,LAST_ACK,TIME_WAIT):
@@ -566,12 +567,16 @@ class StudentUSocket(StudentUSocketBase):
 
 
     if (p.tcp.SYN or p.tcp.FIN or p.tcp.payload) and not retxed:
+      # Tag the packet with current time
+      p.tx_ts = self.stack.now
+
+      # Add packet to retransmit queue
+      self.retx_queue.push(p)
 
       ## Start of Stage 4.4 ##
       if len(p.tcp.payload) > 0:
         self.snd.nxt = p.tcp.seq |PLUS| len(p.tcp.payload)
       ## End of Stage 4.4 ##
-      pass
 
     ## End of Stage 8.1 ##
     
@@ -682,7 +687,17 @@ class StudentUSocket(StudentUSocketBase):
     """
 
     ## Start of Stage 9.1 ##
+    RTT = self.stack.now - acked_pkt.tx_ts
 
+    # Update the smoothed round-trip time (srtt) and rount-trip time
+    self.srtt = (1 - self.alpha) * self.srtt + self.alpha * RTT
+    self.rttvar = (1 - self.beta) * self.rttvar + self.beta * abs(RTT - self.srtt)
+
+    # Compute new RTO
+    self.rto = self.srtt + self.K * self.rttvar
+
+    # Clamp RTO to be between MIN_RTO and MAX_RTO
+    self.rto = max(self.MIN_RTO, min(self.rto, self.MAX_RTO))
     ## End of Stage 9.1 ##
 
     pass
@@ -740,12 +755,13 @@ class StudentUSocket(StudentUSocketBase):
 
     ## Start of Stage 8.2 ##
 
+    acked_pkts = self.retx_queue.pop_upto(seg.ack)
+
     ## End of Stage 8.2 ##
 
 
     ## Start of Stage 9.2 ##
 
-    acked_pkts = [] # remove when implemented
     for (ackno, p) in acked_pkts:
       if not p.retxed:
         self.update_rto(p)
@@ -765,12 +781,30 @@ class StudentUSocket(StudentUSocketBase):
     self.log.info("Got FIN!")
 
     ## Start of Stage 6.1 ##
+    
+    self.set_pending_ack()
+    self.rcv.nxt = seg.seq |PLUS| 1
 
+    # Step 1: Check the state
+    if self.state == ESTABLISHED:
+      # Step 4: Update state to CLOSE_WAIT
+      self.state = CLOSE_WAIT
     ## End of Stage 6.1 ##
 
-
     ## Start of Stage 7.2 ##
+    # Always update the sequence number when you receive a FIN
 
+    if self.state == FIN_WAIT_1:
+      if self.fin_ctrl.acks_our_fin(seg.ack):
+        # Step 1: FIN-ACK recieved st a pending ack and move to TIME_WAIT
+        self.start_timer_timewait()
+      else:
+        # Step 2: Just FIN recieved, set a pending ack and move to CLOSING
+        self.state = CLOSING
+    if self.state == FIN_WAIT_2:
+      # Step 3: FIN recieved, set a pending ack and move to TIME_WAIT
+      self.start_timer_timewait()
+    
     ## End of Stage 7.2 ##
 
   def check_ack(self, seg):
@@ -805,14 +839,21 @@ class StudentUSocket(StudentUSocketBase):
           self.update_window(seg)
 
     ## Start of Stage 6.3 ##
+    if self.state == LAST_ACK:
+      if self.fin_ctrl.acks_our_fin(seg.ack):
+        self._delete_tcb()
     ## Start of Stage 7.3 ##
     if self.state == FIN_WAIT_1:
-      pass
+      if self.fin_ctrl.acks_our_fin(seg.ack):
+        self.state = FIN_WAIT_2
+        # self.set_pending_ack()
     elif self.state == FIN_WAIT_2:
       if self.retx_queue.empty():
         self.set_pending_ack()
     elif self.state == CLOSING:
-      pass
+      if self.fin_ctrl.acks_our_fin(seg.ack):
+        # ACK for FIN in CLOSING state, move to TIME_WAIT
+        self.start_timer_timewait()
     elif self.state == LAST_ACK:
       pass
     elif self.state == TIME_WAIT:
@@ -911,15 +952,16 @@ class StudentUSocket(StudentUSocketBase):
     """
 
     ## Start of Stage 8.3 ##
-    time_in_queue = 0 # modify when implemented
+    if not self.retx_queue.empty():
+      _, p = self.retx_queue.get_earliest_pkt()
+      time_in_queue = self.stack.now - p.tx_ts
 
     ## End of Stage 8.3 ##
-
-    if time_in_queue > self.rto:
-      self.log.debug("earliest packet seqno={0} rto={1} being rtxed".format(p.tcp.seq, self.rto))
-      self.tx(p, retxed=True)
-
-      ## Start of Stage 9.3 ##
+      if time_in_queue > self.rto:
+        self.log.debug("earliest packet seqno={0} rto={1} being rtxed".format(p.tcp.seq, self.rto))
+        self.tx(p, retxed=True)
+        ## Start of Stage 9.3 ##
+        self.rto = min(self.MAX_RTO, self.rto * 2)
 
       ## End of Stage 9.3 ##
 
